@@ -1,0 +1,177 @@
+训练prompt
+###############################################
+模型二：靶点导向的生成流网络 LeadGFlowNet(建立LeadGFlowNet目录，工具文件都放在这个目录下)
+目标： 通过 Oracle（对接计算使用AutoDock Vina/QuickVina2进行奖励评估）打分，高效地发现与特定蛋白质 A_i 高度匹配的分子 B_j。
+模型选择与理由：
+LeadGFlowNet模型是基于GFlowNet算法思想改造而成。传统的强化学习（如 PPO）旨在找到一条最优路径，而 GFlowNet 的目标是学习一个策略，使其采样的终止状态（即最终生成的分子）的概率分布，与 Oracle 给出的奖励 (Reward) 分布成正比。这意味着它不仅能找到最好的分子，还能找到一大批“足够好”的、多样的分子。
+模型架构与组件：
+策略网络 (Policy Network):
+核心: 我们将复用上面已经预训练好的 SynthPolicyNet。
+修改: 我们需要让它能够接收蛋白质靶点 A_i 的信息。
+注意：在SynthPolicyNet训练集中增加蛋白质靶点 A_i 的信息。
+蛋白质编码器 (Protein Encoder): 使用一个预训练的蛋白质语言模型（如 ProtBERT, ESM）或一个简单的 CNN/LSTM，将蛋白质序列 A_i 编码成一个固定长度的向量 h(A_i)。
+条件化 (Conditioning): 在 SynthPolicyNet 的每一步决策中，都将蛋白质向量 h(A_i) 拼接或以注意力机制融入，使得策略变为 P(a_t | s_t, A_i)。
+微调 (Fine-tuning): 在 GFlowNet 的训练过程中，这个预训练好的、条件化的 SynthPolicyNet 将被进一步微调。
+Oracle (奖励函数):
+输入: 一个完整的分子 B_j 和蛋白质 A_i。
+输出: 一个标量奖励 R(B_j, A_i)。
+实现:
+Generated python
+def get_reward(smiles_B_j, sequence_A_i):
+    # 1. 对接打分 (Docking Score)
+    docking_score = run_vina_docking(smiles_B_j, sequence_A_i)
+    
+    # 2. 其他属性 (可选，但暂不实现)
+    qed_score = calculate_qed(smiles_B_j) # 药物相似性
+    sa_score = calculate_sascore(smiles_B_j) # 合成可行性
+    
+    # 3. 组合成最终奖励 R
+    # 我们希望对接分数低、QED高、SA低
+    reward = transform_docking(docking_score) + w1 * qed_score - w2 * sa_score
+    return reward
+Use code with caution.
+Python
+关键: 这个 Oracle 是隐式的。我们只关心最终的 R 值，模型需要自己去学习哪些 (i, j) 的组合能导致高 R 值。
+GFlowNet 训练算法 (Trajectory Balance - 轨迹平衡):
+核心思想: GFlowNet 的训练不依赖于传统的 Bellman 方程，而是基于“流”的守恒。它要求从一个状态出发的所有“流出”量，等于所有到达这个状态的“流入”量。
+训练步骤:
+前向采样 (Forward Sampling): 从一个起始状态（如空分子）开始，使用我们条件化的 SynthPolicyNet (现在称为 P_F)，一步一步地采样动作（选择构建模块和反应），直到生成一个终止状态（最终分子 B_j）。这个过程形成了一条完整的轨迹 (Trajectory) τ。
+反向概率 (Backward Probability): GFlowNet 还需要一个反向策略 P_B(s_{t-1} | s_t)，即从一个状态回到上一步状态的概率。这通常可以被设计成一个简单的、均匀的分布。
+获取奖励: 对最终生成的分子 B_j，调用昂贵的 Oracle，得到奖励 R(B_j, A_i)。
+计算损失: GFlowNet 的轨迹平衡损失 (Trajectory Balance Loss) 大致形式如下：
+Loss(τ) = (log(Z) + Σ log(P_F(a_t|s_t)) - log(R(B_j)) - Σ log(P_B(s_{t-1}|s_t)))^2
+其中 Z 是一个可学习的、代表所有奖励总和的归一化常数。
+更新: 使用这个损失来更新 P_F (即我们的 SynthPolicyNet) 和 Z 的参数。
+两个模型的协同工作流程
+离线阶段:
+使用您的百万级数据集，通过监督学习预训练 SynthPolicyNet。
+训练一个蛋白质编码器 Protein Encoder。
+在线阶段 (RL Fine-tuning):
+将预训练好的 SynthPolicyNet 和 Protein Encoder 组合成一个条件化的策略网络，作为 LeadGFlowNet 的核心。
+开始 LeadGFlowNet 的训练循环:
+输入: 一个固定的蛋白质靶点 A_i。
+LeadGFlowNet 开始正向生成分子。它会从构建模块库中选择一个模块作为起点，然后利用其策略网络 P_F，一步步地选择下一个模块和反应，将分子“养大”。
+每当生成一个完整的分子（终止状态）时，就调用 Oracle 对其进行打分，获得奖励。
+使用轨迹平衡损失来更新策略网络的权重。
+结果: 随着训练的进行，LeadGFlowNet 的策略会逐渐偏向于生成那些能够获得高 Oracle 奖励的分子。因为它学习的是整个奖励分布，所以它不仅能找到对接分数最高的那个分子，还能提供大量结构多样、分数也很高的候选分子，完美地解决了“发现尽可能多的 (i, j) 对”的需求。
+这个两阶段、双模型的框架，既利用了您现有的大规模数据（通过预训练），又高效地结合了昂贵的 Oracle 信号（通过 GFlowNet），是解决您提出的这个创新问题的强大而优雅的方案。
+
+开源工具与框架：构建RL环境可用Gym或自定义接口，底层反应模拟依赖RDKit/OpenBabel；对接计算使用AutoDock Vina/QuickVina2进行奖励评估；蛋白质特征可借助ESM-2/ProtBERT等模型获取；深度学习及RL算法可用PyTorch/TensorFlow结合Stable-Baselines3、RLlib等库实现。反应模板和候选库可来自AiZynthFinder或Rxn数据集；RxnMapper可用于验证模拟反应的原子映射正确性。整个管道中，各组件之间保持模块化，可复用现有工具库加速开发。
+
+################################################
+I'll scan the BindingDB preprocessor script to confirm the columns in protein_ligand_pactivity.csv so the QSAR training can parse it correctly.
+Ran tool
+
+Ran tool
+Ran tool
+
+I added a lightweight QSAR model and a mixed-reward API, and I’ll show you how to train and plug them into LeadGFlowNet.
+
+### 1) 新增内容
+- 新文件：QSAR 训练与推断
+```1:153:LeadGFlowNet/qsar.py
+class QSARMLP(nn.Module): ...
+def train_qsar(csv_path: str, save_path: str = "checkpoints/qsar.pt", cfg: Optional[QSARConfig] = None) -> str: ...
+class QSARPredictor: ...
+```
+- 混合 Reward（支持 QSAR + Docking + QED/SA）
+```18:69:LeadGFlowNet/oracle.py
+def get_reward(
+    smiles_b: str, protein_seq: str, *,
+    use_qsar: bool = False, qsar_predict=None,
+    alpha: float = 0.7, dock_temp: float = 1.0,
+    add_qed: float = 0.0, sub_sa: float = 0.0
+) -> float:
+    ...
+    reward = alpha * r_qsar + (1.0 - alpha) * r_dock + add_qed * qed_score - sub_sa * sa_score
+    return max(0.0, float(reward))
+```
+
+### 2) 训练 QSAR（基于 BindingDB 预处理数据）
+- 若还没生成 `data/protein_ligand_pactivity.csv`：
+```bash
+/Users/jubin/miniconda3/envs/phar/bin/python -m scripts.data_preprocessor_bindingdb
+```
+- 训练 QSAR（默认 MLP + Morgan 指纹 + 简单蛋白编码器）：
+```bash
+PYTHONPATH=/Users/jubin/dev/phar /Users/jubin/miniconda3/envs/phar/bin/python -c "from LeadGFlowNet.qsar import train_qsar; train_qsar('data/protein_ligand_pactivity.csv')"
+```
+产物：`checkpoints/qsar.pt`
+
+### 3) 在 LeadGFlowNet 中使用“分阶段/混合”Reward
+- 构造 QSAR 预测器并混合 docking（docking 仍为占位实现，你后续对接 Vina 即可）：
+```python
+import torch
+from LeadGFlowNet.qsar import QSARPredictor
+from LeadGFlowNet import oracle
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+qsar = QSARPredictor("checkpoints/qsar.pt", device=device)
+
+def reward_fn(smiles_b: str, protein_seq: str, step: int, total_steps: int) -> float:
+    # α 从 0.8 线性衰减到 0.2（前期更依赖 pActivity，后期更偏向 docking）
+    alpha_start, alpha_end = 0.8, 0.2
+    t = max(0.0, min(1.0, step / max(1, total_steps)))
+    alpha = alpha_start + (alpha_end - alpha_start) * t
+    return oracle.get_reward(
+        smiles_b, protein_seq,
+        use_qsar=True,
+        qsar_predict=qsar.predict_pactivity,
+        alpha=alpha,
+        dock_temp=1.0,   # 调整对接分量的温度
+        add_qed=0.1,     # 可选：增加药性偏好
+        sub_sa=0.05      # 可选：惩罚合成复杂度
+    )
+```
+- 与你的 GFlowNet 训练器对接（`LeadGFlowNet/trainer.py` 接受 `reward_fn: Callable[[str,str], float]`）：在采样/评估每条轨迹终止产物时传入 `reward_fn` 即可。示例：
+```python
+# 假设 traj 终止产物为 term_smiles，蛋白为 protein_seq
+R = reward_fn(term_smiles, protein_seq, step=global_step, total_steps=num_steps)
+loss = trainer.trajectory_balance_loss(traj, R)
+```
+
+### 4) 推荐策略
+- 预训练（warm-up）：alpha≈1.0（几乎全 QSAR），不跑 docking，快速收敛稳定。
+- 微调（fine-tune）：逐步降低 alpha，引入 docking；仅对 top-K 候选做对接，缓存结果，控制预算。
+- 混合（全程可用）：使用上述 alpha 退火，兼顾已知活性与新分子探索。
+
+### 5) 备注
+- QSAR 模型简洁稳定，适合 PoC。后续可替换为更强的图模型/GNN 或条件 PCM 模型。
+- `run_vina_docking` 仍为占位；接入 Vina/QuickVina2 时请加缓存、限流。
+- 保证 `get_reward` 返回非负（已处理），以满足 GFlowNet TB 的常见假设。
+
+- 你要我把一个最小可运行的 RL 训练脚本（采样+TB 更新+alpha 退火）也加上吗？可在现有 `LeadGFlowNet/trainer.py` 基础上生成一个 `train_leadgflownet.py` 便于一键跑。
+
+################################################
+I'll add a new inference script to sample synthesis route trees using the trained policy, store JSON with routes and a deduplicated leads_set, and then create a notebook to visualize molecules and their trees.
+Ran tool
+
+I'll update the new inference helper to create a proper PyG batch field for single graphs, then run a quick CPU sampling to ensure JSON is produced.
+Ran tool
+```bash
+PYTHONPATH=/Users/jubin/dev/phar /Users/jubin/miniconda3/envs/phar/bin/python /Users/jubin/dev/phar/LeadGFlowNet/infer_routes.py --use-cpu --protein PQITLWQRPLVTIKIGGQLKEALLDTGADDTVLEEMSLPGRWKPKMIGGIGGFIKVRQYDQILIEICGHKAIGTVLVGPTPVNIIGRNLLTQIGCTLNF --num-samples 2 --max-depth 2 --branch-block-topk 2 --branch-rxn-topk 1 --output-json /Users/jubin/dev/phar/runs/lead_routes.json | cat
+```
+- 推理采样与可视化代码已就位：
+  - 新增 `LeadGFlowNet/infer_routes.py`：按给定 protein 序列采样若干棵合成路径树，输出 `leads_set` 与 `routes` 到 JSON。
+  - 新增 `scripts/visualize_leads_and_routes.ipynb`：加载 JSON，逐个渲染分子和其树状合成路径。
+
+- 用法
+  - 采样生成 JSON（CPU 示例）：
+    ```
+    PYTHONPATH=/Users/jubin/dev/phar /Users/jubin/miniconda3/envs/phar/bin/python -m LeadGFlowNet.infer_routes \
+      --use-cpu \
+      --protein PQITLWQRPLVTIKIGGQLKEALLDTGADDTVLEEMSLPGRWKPKMIGGIGGFIKVRQYDQILIEICGHKAIGTVLVGPTPVNIIGRNLLTQIGCTLNF \
+      --num-samples 3 --max-depth 3 --branch-block-topk 2 --branch-rxn-topk 1 \
+      --output-json runs/lead_routes.json
+    ```
+    - 若使用 ESM2 做蛋白编码：
+      - 加装依赖：`pip install -U transformers accelerate`
+      - 增加参数：`--protein-encoder esm2 --esm2-model facebook/esm2_t6_8M_UR50D`（或 t33_650M）
+  - 在 notebook 中可视化：
+    - 打开 `scripts/visualize_leads_and_routes.ipynb`
+    - 在首行输入 JSON 路径（默认 `../runs/lead_routes.json`），点击“加载”，然后在下拉框中选择 lead 查看树。
+
+- 说明
+  - 采样依赖我们离线构建的前向轨迹数据集作为“可行边”的集合，模型只在这些可行边上进行概率分支并构树。
+  - 若 `leads_set` 为空，说明当前采样深度/分支较浅或未命中可行产物；可提高 `--max-depth` 或 `--branch-*`。
+  - 可后续集成打分（`LeadGFlowNet/oracle.py`）筛选 top-N leads，并在 JSON 中加上评分字段。

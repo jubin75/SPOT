@@ -1,0 +1,28 @@
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Data directories
+data/
+download/
+
+# Library dependencies
+lib/
+
+# Models & checkpoints
+models/
+checkpoints/
+
+# Run outputs
+runs/
+
+# Article
+article/

@@ -1,0 +1,16 @@
+expansion:
+  uspto:
+    - lib/uspto_model.onnx
+    - lib/uspto_templates.csv.gz
+  ringbreaker:
+    - lib/uspto_ringbreaker_model.onnx
+    - lib/uspto_ringbreaker_templates.csv.gz
+filter:
+  uspto: lib/uspto_filter_model.onnx
+stock:
+  zinc: lib/zinc_stock.hdf5
+
+llm:
+  deepseek:
+    api_key: sk-e590f981f8fd4902980638c86c393d8c
+    model: deepseek-v4-pro

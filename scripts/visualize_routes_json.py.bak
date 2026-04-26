@@ -1,0 +1,284 @@
+#!/usr/bin/env python
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import hashlib
+from typing import Dict, List, Tuple, Any, Set
+
+from rdkit import Chem
+from rdkit.Chem import Draw
+from rdkit import RDLogger
+import csv
+
+
+def ensure_dir(path: str) -> None:
+    os.makedirs(path, exist_ok=True)
+
+
+def smiles_png_path(out_mol_dir: str, smiles: str) -> str:
+    key = hashlib.md5(smiles.encode("utf-8")).hexdigest()[:16]
+    return os.path.join(out_mol_dir, f"{key}.png")
+
+
+def render_smiles_png(out_mol_dir: str, smiles: str, size: Tuple[int, int] = (260, 200)) -> str:
+    path = smiles_png_path(out_mol_dir, smiles)
+    if os.path.exists(path):
+        return path
+    try:
+        m = Chem.MolFromSmiles(smiles)
+        if m is None:
+            return ""
+        Draw.MolToFile(m, path, size=size)
+        return path
+    except Exception:
+        return ""
+
+
+def canonicalize_smiles(smiles: str) -> str:
+    """Return RDKit-canonical SMILES if possible, else original string."""
+    if not smiles or "<" in smiles or ">" in smiles:
+        return smiles
+    try:
+        m = Chem.MolFromSmiles(smiles)
+        if m is None:
+            return smiles
+        return Chem.MolToSmiles(m)
+    except Exception:
+        return smiles
+
+
+def load_library_mapping(csv_path: str, smiles_col: str = "smiles", id_col: str = "id") -> Dict[str, str]:
+    """Load a mapping from canonical SMILES -> ID from a CSV file.
+
+    This is used to display the origin ID for root and block molecules.
+    Column names are configurable; we will try reasonable fallbacks if absent.
+    """
+    mapping: Dict[str, str] = {}
+    if not csv_path:
+        return mapping
+    try:
+        with open(csv_path, "r", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            fieldnames = reader.fieldnames or []
+            s_col = smiles_col if smiles_col in fieldnames else (
+                "smiles" if "smiles" in fieldnames else (fieldnames[0] if fieldnames else smiles_col)
+            )
+            # Prefer explicit id_col; otherwise try common fallbacks
+            id_candidates = [id_col, "id", "block_id", "name", "ID"]
+            i_col = next((c for c in id_candidates if c in fieldnames), None)
+            for row in reader:
+                smi = (row.get(s_col, "") or "").strip()
+                if not smi:
+                    continue
+                can = canonicalize_smiles(smi)
+                value = (row.get(i_col, "") if i_col else "").strip()
+                mapping[can] = value
+    except Exception:
+        # Silent fallback: no mapping available
+        return {}
+    return mapping
+
+
+def collect_edges(tree: Dict[str, Any]) -> List[Tuple[str, str, str, str]]:
+    """Return list of edges: (state, block_smiles, rxn_template, result_smiles)."""
+    edges: List[Tuple[str, str, str, str]] = []
+
+    def walk(node: Dict[str, Any]) -> None:
+        state = str(node.get("state", ""))
+        children = node.get("children", []) or []
+        for ch in children:
+            block = str(ch.get("block_smiles", ""))
+            rxn = str(ch.get("rxn_template", ""))
+            result = str(ch.get("result_smiles", ""))
+            edges.append((state, block, rxn, result))
+            sub = ch.get("subtree", {}) or {}
+            if isinstance(sub, dict) and sub:
+                walk(sub)
+
+    if isinstance(tree, dict):
+        walk(tree)
+    return edges
+
+
+def build_dot(route_idx: int, edges: List[Tuple[str, str, str, str]]) -> str:
+    """Build Graphviz DOT content for a route."""
+    lines: List[str] = ["digraph G {", "  rankdir=LR;", "  node [shape=box, style=rounded, fontsize=10];"]
+    # Nodes: states/results as SMILES strings
+    nodes: Set[str] = set()
+    for s, _, _, r in edges:
+        nodes.add(s)
+        nodes.add(r)
+    # Declare nodes (escape quotes)
+    for n in nodes:
+        label = n.replace("\"", "'")
+        lines.append(f"  \"{label}\";")
+    # Edges with labels = block | rxn
+    for s, b, rxn, r in edges:
+        sl = s.replace("\"", "'")
+        rl = r.replace("\"", "'")
+        lab = (b or "(block)") + " | " + (rxn or "(rxn)")
+        lab = lab.replace("\"", "'")
+        lines.append(f"  \"{sl}\" -> \"{rl}\" [label=\"{lab}\", fontsize=9];")
+    lines.append("}")
+    return "\n".join(lines)
+
+
+def write_route_html(
+    html_path: str,
+    route_idx: int,
+    edges: List[Tuple[str, str, str, str]],
+    mol_dir: str,
+    dot_rel: str | None,
+    root_smiles: str,
+    lib_map: Dict[str, str],
+) -> None:
+    # Collect unique SMILES for rendering
+    uniq: List[str] = []
+    seen = set()
+    # include state/result SMILES (skip placeholders)
+    for s, _, _, r in edges:
+        for x in (s, r):
+            if x and ("<" not in x and ">" not in x) and x not in seen:
+                seen.add(x)
+                uniq.append(x)
+    # also include block SMILES for rendering when valid (skip placeholders)
+    for _, b, _, _ in edges:
+        if b and ("<" not in b and ">" not in b) and b not in seen:
+            seen.add(b)
+            uniq.append(b)
+    # include root for rendering
+    if root_smiles and ("<" not in root_smiles and ">" not in root_smiles) and root_smiles not in seen:
+        seen.add(root_smiles)
+        uniq.append(root_smiles)
+    # Render PNGs
+    smi_to_png: Dict[str, str] = {}
+    for smi in uniq:
+        p = render_smiles_png(mol_dir, smi)
+        if p:
+            smi_to_png[smi] = os.path.relpath(p, os.path.dirname(html_path))
+
+    # Build simple step table
+    rows_html: List[str] = []
+    for i, (s, b, rxn, r) in enumerate(edges, start=1):
+        s_img = f"<img src='{smi_to_png.get(s, '')}' width='220'/>" if s in smi_to_png else ""
+        b_img = f"<img src='{smi_to_png.get(b, '')}' width='160'/>" if (b in smi_to_png) else ""
+        r_img = f"<img src='{smi_to_png.get(r, '')}' width='220'/>" if r in smi_to_png else ""
+        b_id = lib_map.get(canonicalize_smiles(b), "") if (b and "<" not in b and ">" not in b) else ""
+        rows_html.append(
+            f"<tr>"
+            f"<td>{i}</td>"
+            f"<td>{s}</td><td>{s_img}</td>"
+            f"<td>{b}</td><td>{b_img}</td><td>{b_id}</td>"
+            f"<td>{rxn}</td>"
+            f"<td>{r}</td><td>{r_img}</td>"
+            f"</tr>"
+        )
+
+    dot_link = f"<p>DOT: <code>{dot_rel}</code></p>" if dot_rel else ""
+    # Root summary
+    root_img = f"<img src='{smi_to_png.get(root_smiles, '')}' width='220'/>" if root_smiles in smi_to_png else ""
+    root_id = lib_map.get(canonicalize_smiles(root_smiles), "") if root_smiles else ""
+    html = f"""
+<!DOCTYPE html>
+<html><head><meta charset='utf-8'><title>Route {route_idx}</title>
+<style>
+table, th, td {{ border: 1px solid #ccc; border-collapse: collapse; }}
+td, th {{ padding: 6px; font-family: monospace; font-size: 12px; }}
+</style>
+</head><body>
+<h2>Route {route_idx}</h2>
+{dot_link}
+<h3>Root</h3>
+<table>
+  <tr><th>root_smiles</th><th>root_img</th><th>root_id</th></tr>
+  <tr><td>{root_smiles}</td><td>{root_img}</td><td>{root_id}</td></tr>
+</table>
+<table>
+  <tr>
+    <th>#</th>
+    <th>state_smiles</th><th>state_img</th>
+    <th>block_smiles</th><th>block_img</th><th>block_id</th>
+    <th>rxn_template</th>
+    <th>result_smiles</th><th>result_img</th>
+  </tr>
+  {''.join(rows_html)}
+</table>
+</body></html>
+"""
+    with open(html_path, "w", encoding="utf-8") as f:
+        f.write(html)
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description="Visualize synthesis routes from lead_routes.json")
+    ap.add_argument("--json", default="runs/lead_routes.json")
+    ap.add_argument("--out", default="runs/routes_viz")
+    ap.add_argument("--max-routes", type=int, default=50)
+    ap.add_argument("--write-dot", action="store_true", help="Write DOT files for each route")
+    # Optional library CSV to annotate root/block IDs by SMILES
+    ap.add_argument("--lib-csv", default="", help="CSV of initial library to lookup IDs (optional)")
+    ap.add_argument("--lib-smiles-col", default="smiles", help="SMILES column name in --lib-csv")
+    ap.add_argument("--lib-id-col", default="id", help="ID column name in --lib-csv")
+    args = ap.parse_args()
+
+    # Silence RDKit parsing error logs (common when placeholders like "<open>" appear)
+    try:
+        RDLogger.DisableLog('rdApp.error')
+    except Exception:
+        pass
+
+    ensure_dir(args.out)
+    mol_dir = os.path.join(args.out, "mols")
+    ensure_dir(mol_dir)
+
+    lib_map = load_library_mapping(args.lib_csv, args.lib_smiles_col, args.lib_id_col) if args.lib_csv else {}
+
+    with open(args.json, "r", encoding="utf-8") as f:
+        obj = json.load(f)
+    routes = obj.get("routes", []) or []
+    total = len(routes)
+    print({"routes": total})
+
+    index_rows: List[str] = []
+    limit = min(max(0, int(args.max_routes)), total) if int(args.max_routes) > 0 else total
+
+    for idx, route in enumerate(routes[:limit], start=1):
+        tree = route.get("tree", {}) or {}
+        root_smiles = route.get("root", "") or str(tree.get("state", ""))
+        edges = collect_edges(tree)
+        # Write DOT
+        dot_rel = None
+        if args.write_dot:
+            dot_path = os.path.join(args.out, f"route_{idx:04d}.dot")
+            dot_rel = os.path.basename(dot_path)
+            with open(dot_path, "w", encoding="utf-8") as f:
+                f.write(build_dot(idx, edges))
+        # Write HTML
+        html_path = os.path.join(args.out, f"route_{idx:04d}.html")
+        write_route_html(html_path, idx, edges, mol_dir, dot_rel, root_smiles, lib_map)
+        index_rows.append(f"<li><a href='route_{idx:04d}.html'>route_{idx:04d}</a> (steps={len(edges)})</li>")
+
+    # Write index.html
+    index_html = f"""
+<!DOCTYPE html>
+<html><head><meta charset='utf-8'><title>Routes Index</title></head>
+<body>
+  <h2>Routes Index</h2>
+  <p>Total routes in JSON: {total}; rendered: {limit}</p>
+  <ul>
+    {''.join(index_rows)}
+  </ul>
+</body></html>
+"""
+    with open(os.path.join(args.out, "index.html"), "w", encoding="utf-8") as f:
+        f.write(index_html)
+    print({"saved": args.out, "rendered": limit})
+
+
+if __name__ == "__main__":
+    main()
+
+
+

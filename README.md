@@ -1,18 +1,26 @@
-# PHAR
+# SPOT
 
-Protein-conditioned synthesis policy pretraining and trajectory-balance fine-tuning for target-specific, synthesizable molecular generation.
+SPOT is a synthesis-first offline-to-online framework for target-specific and synthesizable molecular generation. Instead of starting only from protein sequence or structure and then generating molecules that may be chemically unrealistic or hard to synthesize, SPOT begins with a synthesis prior learned from feasible reaction trajectories and then adapts that prior toward a specific target.
 
-PHAR combines three ideas in one workflow:
+The central idea is to reconcile two objectives that are often separated in molecular design workflows:
+
+- learning how drug-like molecules can be constructed through feasible synthesis routes
+- reallocating generation probability toward molecules that are compatible with a target protein pocket
+
+In this repository, SPOT combines:
 
 - forward synthesis trajectories extracted from retrosynthesis routes
-- behavior-cloning pretraining of a synthesis policy over building blocks and reaction templates
-- conditional GFlowNet fine-tuning with protein-aware rewards such as PLANTAIN, Vina, and optional QSAR
+- synthesis-aware policy pretraining over building blocks and reaction templates
+- offline-to-online trajectory-level fine-tuning under protein-conditioned reward
+- terminal pocket evaluation with PLANTAIN and optional Vina refinement
 
-The project is designed for target-aware lead generation where synthetic feasibility matters as much as activity ranking.
+The overall goal is to generate molecules that remain synthesizable while becoming increasingly target-specific during fine-tuning.
 
-## What the project does
+## Overview
 
-PHAR models molecule generation as a forward synthesis process. Starting from purchasable building blocks, the policy selects a building block and a reaction template at each step to produce the next intermediate or terminal molecule.
+Target-specific molecular generation is commonly driven by protein sequence or structure, but the resulting molecules are often difficult to synthesize, limiting their practical value in drug discovery. SPOT addresses this problem from the opposite direction: it first learns a synthesis prior from forward synthesis trajectories converted from retrosynthetic routes, and then performs protein-conditioned trajectory-level fine-tuning so that the marginal probability of generating a molecule is aligned with its target-related terminal reward.
+
+Starting from purchasable building blocks, the policy selects a building block and a reaction template at each step to produce the next intermediate or terminal molecule. During target adaptation, terminal rewards are derived from pocket-based evaluation using PLANTAIN, with optional Vina refinement, together with lightweight medicinal-chemistry regularization.
 
 The repository supports:
 
@@ -101,7 +109,7 @@ Some advanced workflows require extra local tooling that is not fully managed by
 
 ## Data preparation
 
-PHAR expects forward synthesis trajectories derived from retrosynthesis routes.
+SPOT expects forward synthesis trajectories derived from retrosynthesis routes.
 
 Typical workflow:
 
